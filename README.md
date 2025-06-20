@@ -1,92 +1,137 @@
-> INSTRUCTIONS
+# Go Voice Agent Starter
 
-> 1. If your app requires an UI: Copy the entire contents of https://github.com/deepgram-starters/deepgram-starters-ui to the `./static/` folder.
+Get started using Deepgram's Voice Agent with this Go demo app. This starter application demonstrates how to build a voice agent that can listen to your microphone, process speech, and respond with AI-generated audio.
 
-> 2. The configuration of the `deepgram.toml` file, is required so we can include the starter in future onboarding workflows.
+## Description
 
-> 3. Consistent naming of the project repo is important. Please don't deviate from our standards. Example repo name: [language] [use case] 
+This Go application showcases Deepgram's Voice Agent API capabilities. It includes:
 
-> 4. Use the readme template below, don't deviate from it.
+- **Terminal Interface**: Run the app in your terminal to interact with the voice agent using your computer's microphone
+- **Web Interface**: Launch a web server that provides a browser-based microphone interface
+- **Real-time Processing**: Stream audio to Deepgram's Voice Agent API for live conversation
+- **Audio Output**: Save agent responses as WAV files for playback
 
-> 5. Use the [cursor rules](./.cursor/rules) with [Cursor](https://www.cursor.com/) to help build your starter more quickly!
----
+The app demonstrates how to handle all Voice Agent message types including conversation text, user speech events, agent thinking, and binary audio data.
 
-# [Language] [Usecase] Starter
+## Prerequisites
 
-> Write a brief intro for this project.
+Before running this application, you'll need:
 
-## What is Deepgram?
-> Please leave this section unchanged.
+- **Go 1.21 or higher** installed on your system
+- **A Deepgram API Key** - Get one for free at [console.deepgram.com](https://console.deepgram.com)
+- **Microphone access** on your device
+- **Internet connection** for API communication
 
-[Deepgram’s](https://deepgram.com/) voice AI platform provides APIs for speech-to-text, text-to-speech, and full speech-to-speech voice agents. Over 200,000+ developers use Deepgram to build voice AI products and features.
+## Getting Started
 
-## Sign-up to Deepgram
-
-> Please leave this section unchanged, unless providing a UTM on the URL.
-
-Before you start, it's essential to generate a Deepgram API key to use in this project. [Sign-up now for Deepgram and create an API key](https://console.deepgram.com/signup?jump=keys).
-
-## Quickstart
-
-> Detail the manual steps to get started.
-
-e.g.
-
-### Manual
-
-Follow these steps to get started with this starter application.
-
-#### Clone the repository
-
-Go to GitHub and [clone the repository](https://github.com/deepgram-starters/prerecorded-node-starter).
-
-#### Install dependencies
-
-Install the project dependencies.
+### 1. Clone and Setup
 
 ```bash
-npm install
+git clone <repository-url>
+cd go-voice-agent
+go mod tidy
 ```
 
-#### Edit the config file
+### 2. Set Your API Key
 
-> Config file can be any appropriate file for the framework/language. For e.g.
-> Node is using a config.json file, while Python is only use .env files
-
-Copy the code from `sample.env` and create a new file called `.env`. Paste in the code and enter your API key you generated in the [Deepgram console](https://console.deepgram.com/).
-
-```json
-DEEPGRAM_API_KEY=%api_key%
-```
-
-#### Run the application
-
-> If your starter has a UI, it must always run on port 8080
-
-The `dev` script will run a web and API server concurrently. Once running, you can [access the application in your browser](http://localhost:8080/).
+Set your Deepgram API key as an environment variable:
 
 ```bash
-npm start
+export DEEPGRAM_API_KEY="YOUR_DEEPGRAM_API_KEY"
 ```
 
-## Issue Reporting
+### 3. Run the Application
 
-If you have found a bug or if you have a feature request, please report them at this repository issues section. Please do not report security vulnerabilities on the public GitHub issue tracker. The [Security Policy](./SECURITY.md) details the procedure for contacting Deepgram.
+Start the application with:
 
-## Getting Help
+```bash
+go run main.go
+```
 
-We love to hear from you so if you have questions, comments or find a bug in the project, let us know! You can either:
+The app will:
+- Start a web server on `http://localhost:3000`
+- Initialize the microphone for terminal use
+- Connect to Deepgram's Voice Agent API
+- Display all interactions in the terminal
 
-> be sure to set the repo-name in the issue URL.
+### 4. Use the Application
 
-- [Open an issue in this repository](https://github.com/deepgram-starters/{repo-name]/issues/new)
-- [Join the Deepgram Github Discussions Community](https://github.com/orgs/deepgram/discussions)
-- [Join the Deepgram Discord Community](https://discord.gg/xWRaCDBtW4)
+#### Terminal Mode
+- Speak into your microphone when prompted
+- View real-time conversation text in the terminal
+- Agent responses are saved as WAV files (`output_1.wav`, `output_2.wav`, etc.)
+- Press Enter to exit
 
-## Author
+#### Web Mode
+- Open your browser and navigate to `http://localhost:3000`
+- The page will automatically request microphone access
+- Audio will be streamed to the voice agent in real-time
+- Agent responses will be played back through your speakers
 
-[Deepgram](https://deepgram.com)
+## How It Works
+
+The application uses Deepgram's Go SDK to:
+
+1. **Initialize** the Voice Agent with OpenAI GPT-4o-mini for thinking and Deepgram Nova-3 for speech recognition
+2. **Stream** microphone audio to the Voice Agent API in real-time
+3. **Process** all message types (conversation text, speech events, thinking, etc.)
+4. **Save** agent audio responses as WAV files
+5. **Display** all interactions in the terminal for debugging
+
+## Configuration
+
+The agent is configured with:
+- **Thinking Provider**: OpenAI GPT-4o-mini
+- **Listening Provider**: Deepgram Nova-3
+- **Language**: English
+- **Greeting**: "Hello! How can I help you today?"
+
+You can modify these settings in the `main.go` file under the `tOptions` configuration section.
+
+## Troubleshooting
+
+### Common Issues
+
+- **"DEEPGRAM_API_KEY environment variable is required"**: Make sure you've set your API key correctly
+- **"WebSocket connection failed"**: Check your internet connection and API key validity
+- **"Microphone access failed"**: Ensure your browser/terminal has microphone permissions
+
+### Getting Help
+
+If you encounter any issues:
+
+1. Check the [Deepgram Documentation](https://developers.deepgram.com)
+2. Join our [Discord Community](https://discord.gg/deepgram) for real-time support
+3. Search existing [GitHub Issues](https://github.com/deepgram/starter-apps/issues) for similar problems
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guidelines](CONTRIBUTING.md) for details on how to submit pull requests, report bugs, or suggest new features.
+
+## Security
+
+For security-related questions or to report vulnerabilities, please review our [Security Policy](SECURITY.md).
+
+## Code of Conduct
+
+This project follows our [Code of Conduct](CODE_OF_CONDUCT.md). Please read it to understand our community standards.
 
 ## License
 
-This project is licensed under the MIT license. See the [LICENSE](./LICENSE) file for more info.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- **Documentation**: [developers.deepgram.com](https://developers.deepgram.com)
+- **Discord**: [discord.gg/deepgram](https://discord.gg/deepgram)
+- **Issues**: [GitHub Issues](https://github.com/deepgram/starter-apps/issues)
+
+## Reporting Issues
+
+Found a bug or have a feature request? Please:
+
+1. Search existing issues to avoid duplicates
+2. Create a new issue with a clear title and description
+3. Include steps to reproduce the problem
+4. Provide your environment details (OS, Go version, etc.)
+5. Add any relevant error messages or logs

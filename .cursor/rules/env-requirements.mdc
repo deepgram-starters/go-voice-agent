@@ -6,7 +6,4 @@ alwaysApply: false
 
 # Environment File Requirements
 
-## sample.env Content
-```bash
-DEEPGRAM_API_KEY=%deepgram_api_key%
-```
+- MUST get API keys and other sensitive config from a ENVIRONMENT VARIABLE set in terminal
