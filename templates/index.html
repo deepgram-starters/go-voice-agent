@@ -18,6 +18,8 @@
         let audioQueue = []; // Queue for managing incoming audio chunks
         let isPlaying = false; // Flag to track if we're currently playing audio
         let selectedDeviceId;
+        let audioBuffer = []; // Buffer to accumulate audio data
+        const BUFFER_SIZE = 3200; // Buffer 200ms of audio at 16000Hz
 
         async function init() {
             try {
@@ -84,10 +86,7 @@
                             console.log('Decoded audio data:', audioData.length, 'samples');
 
                             if (audioData.length > 0) {
-                                audioQueue.push(audioData);
-                                if (!isPlaying) {
-                                    playNextInQueue();
-                                }
+                                addAudioToBuffer(Array.from(audioData));
                             } else {
                                 console.warn('Received empty audio data');
                             }
@@ -170,6 +169,22 @@
                 pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
             return pcmData;
+        }
+
+        function addAudioToBuffer(audioData) {
+            // Add new audio data to buffer
+            audioBuffer.push(...audioData);
+
+            // If buffer is large enough, create a chunk and add to queue
+            while (audioBuffer.length >= BUFFER_SIZE) {
+                const chunk = audioBuffer.splice(0, BUFFER_SIZE);
+                audioQueue.push(new Int16Array(chunk));
+
+                // Start playing if not already playing
+                if (!isPlaying) {
+                    playNextInQueue();
+                }
+            }
         }
 
         async function playNextInQueue() {
