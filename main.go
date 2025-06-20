@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -31,6 +32,7 @@ var upgrader = websocket.Upgrader{
 type WebSocketManager struct {
 	connections map[*websocket.Conn]bool
 	mutex       sync.RWMutex
+	writeMutex  sync.Mutex // Separate mutex for write operations
 }
 
 func NewWebSocketManager() *WebSocketManager {
@@ -53,7 +55,15 @@ func (wm *WebSocketManager) RemoveConnection(conn *websocket.Conn) {
 
 func (wm *WebSocketManager) Broadcast(message interface{}) {
 	wm.mutex.RLock()
-	defer wm.mutex.RUnlock()
+	connections := make([]*websocket.Conn, 0, len(wm.connections))
+	for conn := range wm.connections {
+		connections = append(connections, conn)
+	}
+	wm.mutex.RUnlock()
+
+	if len(connections) == 0 {
+		return
+	}
 
 	data, err := json.Marshal(message)
 	if err != nil {
@@ -61,12 +71,16 @@ func (wm *WebSocketManager) Broadcast(message interface{}) {
 		return
 	}
 
-	for conn := range wm.connections {
+	// Use a separate mutex for write operations to prevent concurrent writes
+	wm.writeMutex.Lock()
+	defer wm.writeMutex.Unlock()
+
+	for _, conn := range connections {
 		err := conn.WriteMessage(websocket.TextMessage, data)
 		if err != nil {
 			log.Printf("Error sending message: %v", err)
 			conn.Close()
-			delete(wm.connections, conn)
+			wm.RemoveConnection(conn)
 		}
 	}
 }
@@ -213,9 +227,10 @@ func (dch MyHandler) Run() error {
 
 			// Broadcast audio data to WebSocket clients
 			if dch.wsManager != nil {
+				audioBase64 := base64.StdEncoding.EncodeToString(*br)
 				dch.wsManager.Broadcast(map[string]interface{}{
 					"type":  "agent_speaking",
-					"audio": *br,
+					"audio": audioBase64,
 				})
 			}
 

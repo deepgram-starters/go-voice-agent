@@ -71,10 +71,25 @@
 
                         if (data.type === 'agent_speaking' && data.audio) {
                             console.log('Audio data received:', data.audio.length, 'bytes');
-                            const audioData = new Int16Array(data.audio);
-                            audioQueue.push(audioData);
-                            if (!isPlaying) {
-                                playNextInQueue();
+
+                            // Decode base64 audio data
+                            const binaryString = atob(data.audio);
+                            const bytes = new Uint8Array(binaryString.length);
+                            for (let i = 0; i < binaryString.length; i++) {
+                                bytes[i] = binaryString.charCodeAt(i);
+                            }
+
+                            // Convert to Int16Array for audio processing
+                            const audioData = new Int16Array(bytes.buffer);
+                            console.log('Decoded audio data:', audioData.length, 'samples');
+
+                            if (audioData.length > 0) {
+                                audioQueue.push(audioData);
+                                if (!isPlaying) {
+                                    playNextInQueue();
+                                }
+                            } else {
+                                console.warn('Received empty audio data');
                             }
                         } else if (data.type === 'conversation_text') {
                             console.log('Conversation text:', data.role, ':', data.content);
@@ -172,8 +187,8 @@
                     await audioContext.resume();
                 }
 
-                // Create buffer with correct sample rate for agent's audio (24000Hz)
-                const buffer = audioContext.createBuffer(1, audioData.length, 24000);
+                // Create buffer with correct sample rate for agent's audio (16000Hz)
+                const buffer = audioContext.createBuffer(1, audioData.length, 16000);
                 const channelData = buffer.getChannelData(0);
 
                 // Convert Int16 to Float32 with proper scaling
