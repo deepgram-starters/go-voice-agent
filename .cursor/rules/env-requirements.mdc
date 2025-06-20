@@ -1,0 +1,12 @@
+---
+description: Environment File Requirements
+globs: sample.env
+alwaysApply: false
+---
+
+# Environment File Requirements
+
+## sample.env Content
+```bash
+DEEPGRAM_API_KEY=%deepgram_api_key%
+```

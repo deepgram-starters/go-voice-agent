@@ -1,0 +1,11 @@
+---
+description: License Requirements
+globs: LICENSE
+alwaysApply: false
+---
+
+# License Requirements
+
+## Specifications
+- MUST use an MIT license
+- MUST copyright to Deepgram 2025

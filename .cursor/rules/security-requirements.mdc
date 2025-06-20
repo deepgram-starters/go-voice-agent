@@ -1,0 +1,16 @@
+---
+description: Security Policy Requirements
+globs: SECURITY.md
+alwaysApply: false
+---
+# Security Requirements
+
+Write the contents based on the YAML instructions.
+
+## YAML Instructions
+
+```yaml
+security_policy:
+    description: "Deepgram's security policy can be found on our main website."
+    reference: "https://developers.deepgram.com/documentation/security/security-policy/"
+```
