@@ -5,7 +5,7 @@ author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.co
 useCase = "Agent"
 language = "Go"
 framework = "Go"
-sdk = "3.8.12"
+sdk = "3.1.1"
 
 [build]
 command = "go mod tidy"
