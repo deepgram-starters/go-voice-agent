@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	msginterfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/agent/v1/websocket/interfaces"
 	microphone "github.com/deepgram/deepgram-go-sdk/v3/pkg/audio/microphone"
@@ -218,9 +217,6 @@ func (dch MyHandler) Run() error {
 	go func() {
 		defer wgReceivers.Done()
 
-		counter := 0
-		lastBytesReceived := time.Now().Add(-7 * time.Second)
-
 		for br := range dch.binaryChan {
 			fmt.Printf("\n\n[Binary Data Received]\n")
 			fmt.Printf("Size: %d bytes\n", len(*br))
@@ -233,56 +229,6 @@ func (dch MyHandler) Run() error {
 					"audio": audioBase64,
 				})
 			}
-
-			if lastBytesReceived.Add(5 * time.Second).Before(time.Now()) {
-				counter = counter + 1
-				file, err := os.OpenFile(fmt.Sprintf("output_%d.wav", counter), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o666)
-				if err != nil {
-					fmt.Printf("Failed to open file. Err: %v\n", err)
-					continue
-				}
-				// Add a wav audio container header to the file if you want to play the audio
-				// using a media player like VLC, Media Player, or Apple Music
-				header := []byte{
-					0x52, 0x49, 0x46, 0x46, // "RIFF"
-					0x00, 0x00, 0x00, 0x00, // Placeholder for file size
-					0x57, 0x41, 0x56, 0x45, // "WAVE"
-					0x66, 0x6d, 0x74, 0x20, // "fmt "
-					0x10, 0x00, 0x00, 0x00, // Chunk size (16)
-					0x01, 0x00, // Audio format (1 for PCM)
-					0x01, 0x00, // Number of channels (1)
-					0x80, 0x3e, 0x00, 0x00, // Sample rate (16000)
-					0x00, 0x7d, 0x00, 0x00, // Byte rate (16000 * 2)
-					0x02, 0x00, // Block align (2)
-					0x10, 0x00, // Bits per sample (16)
-					0x64, 0x61, 0x74, 0x61, // "data"
-					0x00, 0x00, 0x00, 0x00, // Placeholder for data size
-				}
-
-				_, err = file.Write(header)
-				if err != nil {
-					fmt.Printf("Failed to write header to file. Err: %v\n", err)
-					continue
-				}
-				file.Close()
-			}
-
-			fmt.Printf("Dumping to WAV file\n")
-			file, err := os.OpenFile(fmt.Sprintf("output_%d.wav", counter), os.O_APPEND|os.O_WRONLY, 0o644)
-			if err != nil {
-				fmt.Printf("Failed to open file. Err: %v\n", err)
-				continue
-			}
-
-			_, err = file.Write(*br)
-			file.Close()
-
-			if err != nil {
-				fmt.Printf("Failed to write to file. Err: %v\n", err)
-				continue
-			}
-
-			lastBytesReceived = time.Now()
 		}
 	}()
 
