@@ -59,11 +59,23 @@ To test the application run:
 go test -v
 ```
 
-## Issue Reporting
+## Getting Help
 
 - [Open an issue in this repository](https://github.com/deepgram-starters/go-voice-agent/issues/new)
 - [Join the Deepgram Github Discussions Community](https://github.com/orgs/deepgram/discussions)
 - [Join the Deepgram Discord Community](https://discord.gg/xWRaCDBtW4)
+
+## Contributing
+
+We welcome contributions! Please see our [Contributing Guidelines](./CONTRIBUTING.md) for details.
+
+## Security
+
+For security concerns, please see our [Security Policy](./SECURITY.md).
+
+## Code of Conduct
+
+Please see our [Code of Conduct](./CODE_OF_CONDUCT.md) for community guidelines.
 
 ## Author
 
