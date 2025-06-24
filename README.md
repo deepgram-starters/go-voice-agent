@@ -53,10 +53,10 @@ http://localhost:3000
 
 ## Testing
 
-Test the application with:
+To test the application run:
 
 ```bash
-@TODO
+go test -v
 ```
 
 ## Issue Reporting
