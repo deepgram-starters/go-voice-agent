@@ -9,7 +9,6 @@ alwaysApply: false
 - MUST have a H1 title
 - MUST have a description
 - MUST have a prerequisite section
-- MUST have a section to create a `.env` file based on the contents of `sample.env`
 - MUST provide simple instructions for both uses of the starter app
 - MUST provide a short section on license, contributing, security, and code of conduct as separate sections, linking to their respective files in their own section
 - MUST have a link to the [Discord](mdc:node-voice-agent/https:/discord.gg/deepgram) to get help

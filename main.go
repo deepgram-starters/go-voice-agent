@@ -1,58 +1,90 @@
----
-description: Starter App Requirements
-globs: index.ts, src/
-alwaysApply: false
----
-
-# Go Voice Agent Starter App Requirements
-
-## Core Requirements
-- SHOULD live in a single file with minimal dependencies, i.e. `main.go`
-- SHOULD use the Go language
-- SHOULD use the latest version of the official Deepgram SDK
-- MUST run in a terminal
-- MUST be usable in command line with a single command
-- MUST Run with `go run main.go`
-- MUST get API keys and other sensitive config from a ENVIRONMENT VARIABLE set in terminal from an export command like `export DEEPGRAM_API_KEY = "YOUR_DEEPGRAM_API_KEY"`
-- MUST provide help code comments explaining the primary functions of the app
-- MUST provide help code comments explaining the main sections of the app
-- MUST be able to use the Deepgram Voice Agent API
-
-## App Requirements:
-- MUST launch a web server that can act as a basic proxy to the agent
-- MUST allow a browser client to open an http file that is an empty web page
-- MUST allow the user to connect their microphone in the browser
-- MUST allow the user user to speak via their microphone in the browser
-- MUST not have any UI elements
-- MUST have the terminal display the interactions with agent
-- MUST Listen for the API output and prints it in the terminal
-- MUST Listen for the API response messages and print it in the terminal
-- MUST Gracefully closes the connection with the agent
-- MUST exit gracefully without any Agent API errors
-- MUST Runs in terminal to connect to the Agent API, and follows a predefined script of interactions.
-
-
-## Example App Code:
-
-```go
-
 package main
 
 // streaming
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"html/template"
+	"log"
+	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	msginterfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/agent/v1/websocket/interfaces"
 	microphone "github.com/deepgram/deepgram-go-sdk/v3/pkg/audio/microphone"
 	client "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/agent"
 	interfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
+	"github.com/gorilla/websocket"
 )
 
+// WebSocket upgrader
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for development
+	},
+}
+
+// WebSocket connection manager
+type WebSocketManager struct {
+	connections map[*websocket.Conn]bool
+	mutex       sync.RWMutex
+	writeMutex  sync.Mutex // Separate mutex for write operations
+}
+
+func NewWebSocketManager() *WebSocketManager {
+	return &WebSocketManager{
+		connections: make(map[*websocket.Conn]bool),
+	}
+}
+
+func (wm *WebSocketManager) AddConnection(conn *websocket.Conn) {
+	wm.mutex.Lock()
+	defer wm.mutex.Unlock()
+	wm.connections[conn] = true
+}
+
+func (wm *WebSocketManager) RemoveConnection(conn *websocket.Conn) {
+	wm.mutex.Lock()
+	defer wm.mutex.Unlock()
+	delete(wm.connections, conn)
+}
+
+func (wm *WebSocketManager) Broadcast(message interface{}) {
+	wm.mutex.RLock()
+	connections := make([]*websocket.Conn, 0, len(wm.connections))
+	for conn := range wm.connections {
+		connections = append(connections, conn)
+	}
+	wm.mutex.RUnlock()
+
+	if len(connections) == 0 {
+		return
+	}
+
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Error marshaling message: %v", err)
+		return
+	}
+
+	// Use a separate mutex for write operations to prevent concurrent writes
+	wm.writeMutex.Lock()
+	defer wm.writeMutex.Unlock()
+
+	for _, conn := range connections {
+		err := conn.WriteMessage(websocket.TextMessage, data)
+		if err != nil {
+			log.Printf("Error sending message: %v", err)
+			conn.Close()
+			wm.RemoveConnection(conn)
+		}
+	}
+}
+
+// MyHandler implements the message handler interface for Deepgram Voice Agent
 type MyHandler struct {
 	binaryChan                   chan *[]byte
 	openChan                     chan *msginterfaces.OpenResponse
@@ -69,9 +101,11 @@ type MyHandler struct {
 	injectionRefusedResponse     chan *msginterfaces.InjectionRefusedResponse
 	keepAliveResponse            chan *msginterfaces.KeepAlive
 	settingsAppliedResponse      chan *msginterfaces.SettingsAppliedResponse
+	wsManager                    *WebSocketManager
 }
 
-func NewMyHandler() *MyHandler {
+// NewMyHandler creates and initializes a new message handler
+func NewMyHandler(wsManager *WebSocketManager) *MyHandler {
 	handler := &MyHandler{
 		binaryChan:                   make(chan *[]byte),
 		openChan:                     make(chan *msginterfaces.OpenResponse),
@@ -88,6 +122,7 @@ func NewMyHandler() *MyHandler {
 		injectionRefusedResponse:     make(chan *msginterfaces.InjectionRefusedResponse),
 		keepAliveResponse:            make(chan *msginterfaces.KeepAlive),
 		settingsAppliedResponse:      make(chan *msginterfaces.SettingsAppliedResponse),
+		wsManager:                    wsManager,
 	}
 
 	go func() {
@@ -172,76 +207,32 @@ func (dch MyHandler) GetSettingsApplied() []*chan *msginterfaces.SettingsApplied
 	return []*chan *msginterfaces.SettingsAppliedResponse{&dch.settingsAppliedResponse}
 }
 
-// Open is the callback for when the connection opens
-// golintci: funlen
+// Run handles all incoming messages from the Deepgram Voice Agent API
+// This function processes all the different message types and prints them to the terminal
 func (dch MyHandler) Run() error {
 	wgReceivers := sync.WaitGroup{}
 
-	// binary channel
+	// binary channel - handles audio data from the agent
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
-
-		counter := 0
-		lastBytesReceived := time.Now().Add(-7 * time.Second)
 
 		for br := range dch.binaryChan {
 			fmt.Printf("\n\n[Binary Data Received]\n")
 			fmt.Printf("Size: %d bytes\n", len(*br))
 
-			if lastBytesReceived.Add(5 * time.Second).Before(time.Now()) {
-				counter = counter + 1
-				file, err := os.OpenFile(fmt.Sprintf("output_%d.wav", counter), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o666)
-				if err != nil {
-					fmt.Printf("Failed to open file. Err: %v\n", err)
-					continue
-				}
-				// Add a wav audio container header to the file if you want to play the audio
-				// using a media player like VLC, Media Player, or Apple Music
-				header := []byte{
-					0x52, 0x49, 0x46, 0x46, // "RIFF"
-					0x00, 0x00, 0x00, 0x00, // Placeholder for file size
-					0x57, 0x41, 0x56, 0x45, // "WAVE"
-					0x66, 0x6d, 0x74, 0x20, // "fmt "
-					0x10, 0x00, 0x00, 0x00, // Chunk size (16)
-					0x01, 0x00, // Audio format (1 for PCM)
-					0x01, 0x00, // Number of channels (1)
-					0x80, 0x3e, 0x00, 0x00, // Sample rate (16000)
-					0x00, 0x7d, 0x00, 0x00, // Byte rate (16000 * 2)
-					0x02, 0x00, // Block align (2)
-					0x10, 0x00, // Bits per sample (16)
-					0x64, 0x61, 0x74, 0x61, // "data"
-					0x00, 0x00, 0x00, 0x00, // Placeholder for data size
-				}
-
-				_, err = file.Write(header)
-				if err != nil {
-					fmt.Printf("Failed to write header to file. Err: %v\n", err)
-					continue
-				}
-				file.Close()
+			// Broadcast audio data to WebSocket clients
+			if dch.wsManager != nil {
+				audioBase64 := base64.StdEncoding.EncodeToString(*br)
+				dch.wsManager.Broadcast(map[string]interface{}{
+					"type":  "agent_speaking",
+					"audio": audioBase64,
+				})
 			}
-
-			fmt.Printf("Dumping to WAV file\n")
-			file, err := os.OpenFile(fmt.Sprintf("output_%d.wav", counter), os.O_APPEND|os.O_WRONLY, 0o644)
-			if err != nil {
-				fmt.Printf("Failed to open file. Err: %v\n", err)
-				continue
-			}
-
-			_, err = file.Write(*br)
-			file.Close()
-
-			if err != nil {
-				fmt.Printf("Failed to write to file. Err: %v\n", err)
-				continue
-			}
-
-			lastBytesReceived = time.Now()
 		}
 	}()
 
-	// open channel
+	// open channel - handles connection open events
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -251,7 +242,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// welcome response channel
+	// welcome response channel - handles agent welcome messages
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -261,7 +252,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// conversation text response channel
+	// conversation text response channel - handles text conversation messages
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -269,10 +260,19 @@ func (dch MyHandler) Run() error {
 		for ctr := range dch.conversationTextResponse {
 			fmt.Printf("\n\n[ConversationTextResponse]\n")
 			fmt.Printf("%s: %s\n\n", ctr.Role, ctr.Content)
+
+			// Broadcast conversation text to WebSocket clients
+			if dch.wsManager != nil {
+				dch.wsManager.Broadcast(map[string]interface{}{
+					"type":    "conversation_text",
+					"role":    ctr.Role,
+					"content": ctr.Content,
+				})
+			}
 		}
 	}()
 
-	// user started speaking response channel
+	// user started speaking response channel - handles user speech start events
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -282,7 +282,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// agent thinking response channel
+	// agent thinking response channel - handles agent thinking events
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -292,7 +292,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// function call request response channel
+	// function call request response channel - handles function call requests
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -302,7 +302,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// agent started speaking response channel
+	// agent started speaking response channel - handles agent speech start events
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -312,7 +312,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// agent audio done response channel
+	// agent audio done response channel - handles agent speech end events
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -322,7 +322,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// keep alive response channel
+	// keep alive response channel - handles keep alive messages
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -332,7 +332,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// settings applied response channel
+	// settings applied response channel - handles settings confirmation
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -342,7 +342,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// close channel
+	// close channel - handles connection close events
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -352,7 +352,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// error channel
+	// error channel - handles error messages
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -366,7 +366,7 @@ func (dch MyHandler) Run() error {
 		}
 	}()
 
-	// unhandled event channel
+	// unhandled event channel - handles any unhandled message types
 	wgReceivers.Add(1)
 	go func() {
 		defer wgReceivers.Done()
@@ -383,7 +383,86 @@ func (dch MyHandler) Run() error {
 	return nil
 }
 
+// serveWebPage serves the HTML page for browser microphone access
+func serveWebPage(w http.ResponseWriter, r *http.Request) {
+	tmpl, err := template.ParseFiles("templates/index.html")
+	if err != nil {
+		http.Error(w, "Error loading template", http.StatusInternalServerError)
+		return
+	}
+
+	err = tmpl.Execute(w, nil)
+	if err != nil {
+		http.Error(w, "Error executing template", http.StatusInternalServerError)
+		return
+	}
+}
+
+// handleWebSocket handles WebSocket connections for the voice agent interface
+func handleWebSocket(wsManager *WebSocketManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("Error upgrading connection: %v", err)
+			return
+		}
+
+		wsManager.AddConnection(conn)
+		log.Printf("New WebSocket connection established")
+
+		// Send initial connection message
+		conn.WriteJSON(map[string]interface{}{
+			"type":    "connected",
+			"message": "Connected to Voice Agent",
+		})
+
+		// Handle incoming messages
+		for {
+			messageType, message, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("Error reading message: %v", err)
+				wsManager.RemoveConnection(conn)
+				conn.Close()
+				break
+			}
+
+			// Handle binary audio data
+			if messageType == websocket.BinaryMessage {
+				log.Printf("Received binary audio data: %d bytes", len(message))
+				// Here you would forward the audio data to the Deepgram Voice Agent
+				// For now, we'll just log it
+			}
+
+			// Handle text messages
+			if messageType == websocket.TextMessage {
+				log.Printf("Received text message: %s", string(message))
+			}
+		}
+	}
+}
+
 func main() {
+	// Check for required environment variable
+	apiKey := os.Getenv("DEEPGRAM_API_KEY")
+	if apiKey == "" {
+		fmt.Println("ERROR: DEEPGRAM_API_KEY environment variable is required")
+		fmt.Println("Please set it with: export DEEPGRAM_API_KEY=\"YOUR_DEEPGRAM_API_KEY\"")
+		os.Exit(1)
+	}
+
+	// Create WebSocket manager
+	wsManager := NewWebSocketManager()
+
+	// Start web server for browser access
+	go func() {
+		http.HandleFunc("/", serveWebPage)
+		http.HandleFunc("/socket.io/", handleWebSocket(wsManager))
+
+		fmt.Println("Starting web server on http://localhost:3000")
+		fmt.Println("Open your browser and navigate to http://localhost:3000 to access the voice agent interface")
+		log.Fatal(http.ListenAndServe(":3000", nil))
+	}()
+
 	// init library
 	microphone.Initialize()
 
@@ -417,11 +496,11 @@ func main() {
 	tOptions.Agent.Greeting = "Hello! How can I help you today?"
 
 	// implement your own callback
-	callback := msginterfaces.AgentMessageChan(*NewMyHandler())
+	callback := msginterfaces.AgentMessageChan(*NewMyHandler(wsManager))
 
 	// create a Deepgram client
 	fmt.Printf("Creating new Deepgram WebSocket client...\n")
-	dgClient, err := client.NewWSUsingChan(ctx, "", cOptions, tOptions, callback)
+	dgClient, err := client.NewWSUsingChan(ctx, apiKey, cOptions, tOptions, callback)
 	if err != nil {
 		fmt.Printf("ERROR creating LiveTranscription connection:\n- Error: %v\n- Type: %T\n", err, err)
 		return
@@ -488,16 +567,3 @@ func main() {
 
 	fmt.Printf("\n\nProgram exiting...\n")
 }
-
-
-```
-
-
-## Test Requirements
-- MUST have tests that validates the apps functionality is working
-
-  Voice Agent Server
-    ✓ should start the server successfully
-    ✓ should establish WebSocket connection
-    ✓ should create Deepgram agent when WebSocket connects
-    ✓ should handle audio data from client
