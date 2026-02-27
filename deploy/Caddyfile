@@ -1,0 +1,52 @@
+{
+	order rate_limit before basicauth
+}
+
+:8080 {
+	# HTML page: Caddy templates inject base path
+	@htmlpage {
+		path /
+		path /index.html
+	}
+	handle @htmlpage {
+		templates
+		root * /app/frontend/dist
+		rewrite * /index.html
+		file_server
+	}
+
+	# Session endpoint: 5 req/min per IP
+	handle /api/session {
+		rate_limit {
+			zone session {
+				key {remote_host}
+				events 5
+				window 1m
+			}
+		}
+		reverse_proxy localhost:{$BACKEND_PORT:8081}
+	}
+
+	# API endpoints (including WebSocket upgrade): 120 req/min per IP
+	handle /api/* {
+		rate_limit {
+			zone api {
+				key {remote_host}
+				events 120
+				window 1m
+			}
+		}
+		reverse_proxy localhost:{$BACKEND_PORT:8081}
+	}
+
+	# Health check: proxied to backend (used by Fly.io)
+	handle /health {
+		reverse_proxy localhost:{$BACKEND_PORT:8081}
+	}
+
+	# Static assets served by Caddy
+	handle {
+		root * /app/frontend/dist
+		file_server
+	}
+}

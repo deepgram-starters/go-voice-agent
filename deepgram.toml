@@ -1,14 +1,51 @@
 [meta]
-title = "Go Voice Agent Starter"
+title = "Go Voice Agent"
 description = "Get started using Deepgram's Voice Agent with this Go demo app"
 author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.com)"
+repository = "https://github.com/deepgram-starters/go-voice-agent"
 useCase = "voice-agent"
 language = "go"
-sdk = "3.1.1"
+framework = "go"
+sdk = "N/A"
 tags = ["voice-agent", "conversational-ai", "voice-ai", "voice-bot", "go"]
 
-[build]
-command = "go mod tidy"
+[check]
+command = ["command -v git", "command -v go"]
+message = "Prerequisites checked"
 
-[post-build]
-message = "Run `go run main.go` to get started."
+[install.pre]
+command = "git submodule update --init --recursive"
+message = "Submodules initialized"
+
+[install]
+command = "go mod tidy"
+message = "Dependencies installed"
+
+[install.config]
+sample = "sample.env"
+output = ".env"
+
+[start.pre]
+command = ["test -f .env || echo 'Error: .env file not found'", "test -d frontend/.git || echo 'Error: Frontend submodule not initialized'"]
+message = "Pre-flight checks complete"
+
+[start]
+command = ["go run main.go", "cd frontend && pnpm run dev -- --port 8080 --no-open"]
+parallel = true
+message = "Application running on http://localhost:8080"
+
+[update]
+command = "git submodule update --remote --merge"
+message = "Submodules updated"
+
+[clean]
+command = ["rm -rf frontend/node_modules", "rm -rf frontend/dist"]
+message = "Build artifacts cleaned"
+
+[eject-frontend]
+command = "make eject-frontend"
+message = "Frontend ejected successfully"
+
+[test]
+command = "echo 'No tests configured'"
+message = "Tests skipped"
