@@ -287,6 +287,13 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 				} else {
 					log.Printf("Client read error: %v", err)
 				}
+				// Complete the close handshake by replying with a close frame
+				closeCode := websocket.CloseNormalClosure
+				if ce, ok := err.(*websocket.CloseError); ok {
+					closeCode = getSafeCloseCode(ce.Code)
+				}
+				clientConn.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(closeCode, ""))
 				return
 			}
 			if err := deepgramConn.WriteMessage(messageType, data); err != nil {
@@ -303,6 +310,7 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 		deepgramConn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Client disconnected"))
 		deepgramConn.Close()
+		clientConn.Close()
 	case <-deepgramDone:
 		log.Println("Deepgram disconnected, closing client connection")
 		clientConn.Close()
