@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/go-voice-agent"
 useCase = "voice-agent"
 language = "go"
 framework = "go"
-sdk = "N/A"
+sdk = "deepgram-go-sdk"
 tags = ["voice-agent", "conversational-ai", "voice-ai", "voice-bot", "go"]
 
 [check]
