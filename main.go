@@ -187,6 +187,10 @@ func handleMetadata(w http.ResponseWriter, r *http.Request) {
 type agentHandler struct {
 	conn *websocket.Conn
 	mu   *sync.Mutex
+	// teardown closes the browser connection so a Deepgram-side close/error
+	// propagates to the client and unblocks the handler's ReadMessage pump.
+	// Safe to call multiple times.
+	teardown func()
 
 	binaryChan           chan *[]byte
 	openChan             chan *agentmsg.OpenResponse
@@ -205,10 +209,11 @@ type agentHandler struct {
 	settingsAppliedChan  chan *agentmsg.SettingsAppliedResponse
 }
 
-func newAgentHandler(conn *websocket.Conn, mu *sync.Mutex) *agentHandler {
+func newAgentHandler(conn *websocket.Conn, mu *sync.Mutex, teardown func()) *agentHandler {
 	h := &agentHandler{
 		conn:                 conn,
 		mu:                   mu,
+		teardown:             teardown,
 		binaryChan:           make(chan *[]byte),
 		openChan:             make(chan *agentmsg.OpenResponse),
 		welcomeChan:          make(chan *agentmsg.WelcomeResponse),
@@ -340,12 +345,20 @@ func (h *agentHandler) run() {
 		}
 	}()
 	go func() {
+		// Deepgram closed the session: tear down the browser connection so the
+		// handler's ReadMessage pump returns instead of blocking until the
+		// browser happens to disconnect.
 		for range h.closeChan {
+			h.teardown()
 		}
 	}()
 	go func() {
+		// Forward the error to the browser, then end the session — an agent
+		// error is terminal, and leaving the pump blocked would leak the
+		// connection and hang the UI.
 		for v := range h.errorChan {
 			h.sendJSON(v)
+			h.teardown()
 		}
 	}()
 	go func() {
@@ -438,7 +451,20 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("Initiating Deepgram Agent connection...")
 	cOptions := &dginterfaces.ClientOptions{EnableKeepAlive: true}
-	handler := newAgentHandler(clientConn, writeMu)
+
+	// teardown tears down the browser session exactly once: send a close frame
+	// and close the connection (which unblocks the ReadMessage pump below). It
+	// is invoked by the SDK handler goroutines on a Deepgram-side close/error.
+	var closeOnce sync.Once
+	teardown := func() {
+		closeOnce.Do(func() {
+			writeMu.Lock()
+			clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			writeMu.Unlock()
+			clientConn.Close()
+		})
+	}
+	handler := newAgentHandler(clientConn, writeMu, teardown)
 
 	dgClient, err := agent.NewWSUsingChan(context.Background(), appConfig.deepgramAPIKey, cOptions, settings, agentmsg.AgentMessageChan(handler))
 	if err != nil {
