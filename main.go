@@ -192,6 +192,13 @@ type agentHandler struct {
 	// Safe to call multiple times.
 	teardown func()
 
+	// done is closed exactly once (via Close) when the session ends. The SDK
+	// never closes the event channels it sends on, so each relay goroutine
+	// selects on done to exit cleanly instead of blocking on its channel
+	// forever (which would leak ~16 goroutines per connection).
+	done      chan struct{}
+	closeOnce sync.Once
+
 	binaryChan           chan *[]byte
 	openChan             chan *agentmsg.OpenResponse
 	welcomeChan          chan *agentmsg.WelcomeResponse
@@ -214,6 +221,7 @@ func newAgentHandler(conn *websocket.Conn, mu *sync.Mutex, teardown func()) *age
 		conn:                 conn,
 		mu:                   mu,
 		teardown:             teardown,
+		done:                 make(chan struct{}),
 		binaryChan:           make(chan *[]byte),
 		openChan:             make(chan *agentmsg.OpenResponse),
 		welcomeChan:          make(chan *agentmsg.WelcomeResponse),
@@ -294,92 +302,233 @@ func (h *agentHandler) GetSettingsApplied() []*chan *agentmsg.SettingsAppliedRes
 	return []*chan *agentmsg.SettingsAppliedResponse{&h.settingsAppliedChan}
 }
 
-// run relays every Deepgram Agent event to the browser connection.
+// Close signals every relay goroutine to exit. Safe to call multiple times;
+// invoked when the session ends (client disconnect or Deepgram-side teardown).
+func (h *agentHandler) Close() {
+	h.closeOnce.Do(func() {
+		close(h.done)
+	})
+}
+
+// run relays every Deepgram Agent event to the browser connection. Each loop
+// selects on h.done so it exits when the session ends: the SDK never closes
+// the channels it sends on, so a plain `for range ch` would block forever and
+// leak the goroutine (~16 per connection).
 func (h *agentHandler) run() {
 	go func() {
-		for br := range h.binaryChan {
-			h.mu.Lock()
-			if err := h.conn.WriteMessage(websocket.BinaryMessage, *br); err != nil {
-				log.Printf("Failed to forward agent audio to client: %v", err)
+		for {
+			select {
+			case <-h.done:
+				return
+			case br, ok := <-h.binaryChan:
+				if !ok {
+					return
+				}
+				h.mu.Lock()
+				if err := h.conn.WriteMessage(websocket.BinaryMessage, *br); err != nil {
+					log.Printf("Failed to forward agent audio to client: %v", err)
+				}
+				h.mu.Unlock()
 			}
-			h.mu.Unlock()
 		}
 	}()
 	go func() {
-		for range h.openChan {
+		for {
+			select {
+			case <-h.done:
+				return
+			case _, ok := <-h.openChan:
+				if !ok {
+					return
+				}
+			}
 		}
 	}()
 	go func() {
-		for v := range h.welcomeChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.welcomeChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.conversationChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.conversationChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.userStartedChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.userStartedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.agentThinkingChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.agentThinkingChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.functionCallChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.functionCallChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.agentStartedChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.agentStartedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.agentAudioDoneChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.agentAudioDoneChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
 		// Deepgram closed the session: tear down the browser connection so the
 		// handler's ReadMessage pump returns instead of blocking until the
 		// browser happens to disconnect.
-		for range h.closeChan {
-			h.teardown()
+		for {
+			select {
+			case <-h.done:
+				return
+			case _, ok := <-h.closeChan:
+				if !ok {
+					return
+				}
+				h.teardown()
+			}
 		}
 	}()
 	go func() {
 		// Forward the error to the browser, then end the session — an agent
 		// error is terminal, and leaving the pump blocked would leak the
 		// connection and hang the UI.
-		for v := range h.errorChan {
-			h.sendJSON(v)
-			h.teardown()
+		//
+		// The relay map is hand-built with lowercase keys: the SDK's
+		// ErrorResponse (an alias for DeepgramError) has no json:"type" tag, so
+		// marshaling it directly emits {"Type":"Error",...} (capital T) and the
+		// frontend's `case 'Error'` never fires. Emit type/description/code the
+		// way the browser expects.
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.errorChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(map[string]any{
+					"type":        "Error",
+					"description": v.Description,
+					"code":        v.ErrCode,
+				})
+				h.teardown()
+			}
 		}
 	}()
 	go func() {
 		// Events not explicitly modeled by the SDK (e.g. PromptUpdated, SpeakUpdated,
 		// FunctionCallResponse) arrive here as raw bytes; forward them verbatim.
-		for br := range h.unhandledChan {
-			h.sendText(*br)
+		for {
+			select {
+			case <-h.done:
+				return
+			case br, ok := <-h.unhandledChan:
+				if !ok {
+					return
+				}
+				h.sendText(*br)
+			}
 		}
 	}()
 	go func() {
-		for v := range h.injectionRefusedChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.injectionRefusedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 	go func() {
-		for range h.keepAliveChan {
+		for {
+			select {
+			case <-h.done:
+				return
+			case _, ok := <-h.keepAliveChan:
+				if !ok {
+					return
+				}
+			}
 		}
 	}()
 	go func() {
-		for v := range h.settingsAppliedChan {
-			h.sendJSON(v)
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.settingsAppliedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
 		}
 	}()
 }
@@ -465,6 +614,9 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	handler := newAgentHandler(clientConn, writeMu, teardown)
+	// Signal the relay goroutines to exit when this handler returns (client
+	// disconnect or any error path), so they don't leak.
+	defer handler.Close()
 
 	dgClient, err := agent.NewWSUsingChan(context.Background(), appConfig.deepgramAPIKey, cOptions, settings, agentmsg.AgentMessageChan(handler))
 	if err != nil {
