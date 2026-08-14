@@ -304,6 +304,12 @@ func (h *agentHandler) GetSettingsApplied() []*chan *agentmsg.SettingsAppliedRes
 
 // Close signals every relay goroutine to exit. Safe to call multiple times;
 // invoked when the session ends (client disconnect or Deepgram-side teardown).
+//
+// Call this only after the SDK client has been stopped (see handleVoiceAgent's
+// defer order). The SDK sends on unbuffered channels, so if an event lands in
+// the window between done closing and the SDK's read loop exiting, that send
+// has no reader and parks the SDK goroutine. Stopping the client first shuts
+// the read loop down before the readers go away.
 func (h *agentHandler) Close() {
 	h.closeOnce.Do(func() {
 		close(h.done)
@@ -625,6 +631,12 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 	handler := newAgentHandler(clientConn, writeMu, teardown)
 	// Signal the relay goroutines to exit when this handler returns (client
 	// disconnect or any error path), so they don't leak.
+	//
+	// Registered BEFORE the dgClient.Stop() defer below, so it runs AFTER it —
+	// the ordering is load-bearing. Stop() pushes a CloseResponse onto the
+	// handler's channel synchronously while holding the SDK's connection mutex,
+	// so if the relay goroutines were already gone that send would block
+	// forever and hang this request goroutine, not merely leak one.
 	defer handler.Close()
 
 	dgClient, err := agent.NewWSUsingChan(context.Background(), appConfig.deepgramAPIKey, cOptions, settings, agentmsg.AgentMessageChan(handler))
@@ -639,6 +651,7 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 		sendClientError(clientConn, writeMu, "CONNECTION_FAILED", "Failed to establish proxy connection")
 		return
 	}
+	// Must run before handler.Close() — see the note on that defer above.
 	defer dgClient.Stop()
 
 	log.Println("Connected to Deepgram Agent API")
