@@ -461,6 +461,15 @@ func (h *agentHandler) run() {
 		// marshaling it directly emits {"Type":"Error",...} (capital T) and the
 		// frontend's `case 'Error'` never fires. Emit type/description/code the
 		// way the browser expects.
+		//
+		// The code is a fixed PROVIDER_ERROR rather than the SDK's ErrCode.
+		// Deepgram's wire Error event is {type, description, code}, but the SDK
+		// struct maps its code field to `err_code`, so the wire code is dropped
+		// during unmarshal and ErrCode is always empty here; the errors the SDK
+		// synthesizes from a transport failure never set it either. The starter
+		// error contract restricts code to its own enum in any case, and
+		// PROVIDER_ERROR is the value it reserves for an upstream failure —
+		// matching what the other voice-agent starters relay.
 		for {
 			select {
 			case <-h.done:
@@ -472,7 +481,7 @@ func (h *agentHandler) run() {
 				h.sendJSON(map[string]any{
 					"type":        "Error",
 					"description": v.Description,
-					"code":        v.ErrCode,
+					"code":        "PROVIDER_ERROR",
 				})
 				h.teardown()
 			}
