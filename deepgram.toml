@@ -6,7 +6,7 @@ repository = "https://github.com/deepgram-starters/go-voice-agent"
 useCase = "voice-agent"
 language = "go"
 framework = "go"
-sdk = "N/A"
+sdk = "deepgram-go-sdk"
 tags = ["voice-agent", "conversational-ai", "voice-ai", "voice-bot", "go"]
 
 [check]
@@ -47,5 +47,5 @@ command = "make eject-frontend"
 message = "Frontend ejected successfully"
 
 [test]
-command = "echo 'No tests configured'"
-message = "Tests skipped"
+command = "bash contracts/tests/run-voice-agent-app.sh"
+message = "Contract conformance tests"

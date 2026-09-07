@@ -25,6 +25,10 @@ import (
 	"syscall"
 	"time"
 
+	agentmsg "github.com/deepgram/deepgram-go-sdk/v3/pkg/api/agent/v1/websocket/interfaces"
+	agent "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/agent"
+	dginterfaces "github.com/deepgram/deepgram-go-sdk/v3/pkg/client/interfaces"
+
 	"github.com/BurntSushi/toml"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
@@ -41,15 +45,6 @@ var appConfig struct {
 	port             string
 	host             string
 	sessionSecret    []byte
-}
-
-// reservedCloseCodes lists WebSocket close codes that cannot be set by applications.
-// Per RFC 6455, codes 1004, 1005, 1006, and 1015 are reserved.
-var reservedCloseCodes = map[int]bool{
-	1004: true,
-	1005: true,
-	1006: true,
-	1015: true,
 }
 
 // ============================================================================
@@ -112,19 +107,6 @@ func validateWsToken(protocols []string, secret []byte) string {
 // DeepgramToml represents the structure of deepgram.toml.
 type DeepgramToml struct {
 	Meta map[string]interface{} `toml:"meta"`
-}
-
-// ============================================================================
-// WEBSOCKET HELPERS
-// ============================================================================
-
-// getSafeCloseCode returns a valid WebSocket close code.
-// Reserved codes (1004, 1005, 1006, 1015) are translated to 1000 (normal closure).
-func getSafeCloseCode(code int) int {
-	if code >= 1000 && code <= 4999 && !reservedCloseCodes[code] {
-		return code
-	}
-	return websocket.CloseNormalClosure
 }
 
 // ============================================================================
@@ -198,8 +180,406 @@ func handleMetadata(w http.ResponseWriter, r *http.Request) {
 // WEBSOCKET PROXY HANDLER
 // ============================================================================
 
-// handleVoiceAgent proxies WebSocket connections to Deepgram's Voice Agent API.
-// It forwards all messages (JSON and binary) bidirectionally without modification.
+// browserWriteTimeout bounds every write to the browser socket. A stalled
+// browser (backgrounded tab, full TCP receive window) must not be able to wedge
+// the Deepgram client: the SDK sends events on unbuffered channels while holding
+// its connection mutex, so a relay goroutine blocked forever in WriteMessage
+// stops draining its channel, parks the SDK's read loop and deadlocks both
+// sockets for the lifetime of the process.
+const browserWriteTimeout = 5 * time.Second
+
+// writeToBrowser serializes one frame to the browser under a write deadline.
+// Every write to the client socket must go through here: the relay goroutines,
+// the request goroutine and the shutdown path all share one connection, and
+// gorilla panics on concurrent writes.
+func writeToBrowser(conn *websocket.Conn, mu *sync.Mutex, msgType int, data []byte) error {
+	mu.Lock()
+	defer mu.Unlock()
+	if err := conn.SetWriteDeadline(time.Now().Add(browserWriteTimeout)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(msgType, data)
+}
+
+// agentHandler implements the Deepgram SDK AgentMessageChan interface and relays
+// Voice Agent events to the browser WebSocket: audio as binary frames and all
+// JSON events (including any not explicitly modeled, via UnhandledEvent) as text
+// frames, preserving the wire format the frontend already expects.
+type agentHandler struct {
+	conn *websocket.Conn
+	mu   *sync.Mutex
+	// teardown closes the browser connection so a Deepgram-side close/error
+	// propagates to the client and unblocks the handler's ReadMessage pump.
+	// Safe to call multiple times.
+	teardown func(code int, reason string)
+
+	// done is closed exactly once (via Close) when the session ends. The SDK
+	// never closes the event channels it sends on, so each relay goroutine
+	// selects on done to exit cleanly instead of blocking on its channel
+	// forever (which would leak ~16 goroutines per connection).
+	done      chan struct{}
+	closeOnce sync.Once
+
+	binaryChan           chan *[]byte
+	openChan             chan *agentmsg.OpenResponse
+	welcomeChan          chan *agentmsg.WelcomeResponse
+	conversationChan     chan *agentmsg.ConversationTextResponse
+	userStartedChan      chan *agentmsg.UserStartedSpeakingResponse
+	agentThinkingChan    chan *agentmsg.AgentThinkingResponse
+	functionCallChan     chan *agentmsg.FunctionCallRequestResponse
+	agentStartedChan     chan *agentmsg.AgentStartedSpeakingResponse
+	agentAudioDoneChan   chan *agentmsg.AgentAudioDoneResponse
+	closeChan            chan *agentmsg.CloseResponse
+	errorChan            chan *agentmsg.ErrorResponse
+	unhandledChan        chan *[]byte
+	injectionRefusedChan chan *agentmsg.InjectionRefusedResponse
+	keepAliveChan        chan *agentmsg.KeepAlive
+	settingsAppliedChan  chan *agentmsg.SettingsAppliedResponse
+}
+
+func newAgentHandler(conn *websocket.Conn, mu *sync.Mutex, teardown func(code int, reason string)) *agentHandler {
+	h := &agentHandler{
+		conn:                 conn,
+		mu:                   mu,
+		teardown:             teardown,
+		done:                 make(chan struct{}),
+		binaryChan:           make(chan *[]byte),
+		openChan:             make(chan *agentmsg.OpenResponse),
+		welcomeChan:          make(chan *agentmsg.WelcomeResponse),
+		conversationChan:     make(chan *agentmsg.ConversationTextResponse),
+		userStartedChan:      make(chan *agentmsg.UserStartedSpeakingResponse),
+		agentThinkingChan:    make(chan *agentmsg.AgentThinkingResponse),
+		functionCallChan:     make(chan *agentmsg.FunctionCallRequestResponse),
+		agentStartedChan:     make(chan *agentmsg.AgentStartedSpeakingResponse),
+		agentAudioDoneChan:   make(chan *agentmsg.AgentAudioDoneResponse),
+		closeChan:            make(chan *agentmsg.CloseResponse),
+		errorChan:            make(chan *agentmsg.ErrorResponse),
+		unhandledChan:        make(chan *[]byte),
+		injectionRefusedChan: make(chan *agentmsg.InjectionRefusedResponse),
+		keepAliveChan:        make(chan *agentmsg.KeepAlive),
+		settingsAppliedChan:  make(chan *agentmsg.SettingsAppliedResponse),
+	}
+	go h.run()
+	return h
+}
+
+// sendJSON marshals a Deepgram event and writes it to the browser as a text frame.
+func (h *agentHandler) sendJSON(v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("Failed to marshal agent event: %v", err)
+		return
+	}
+	h.sendText(data)
+}
+
+func (h *agentHandler) sendText(data []byte) {
+	if err := writeToBrowser(h.conn, h.mu, websocket.TextMessage, data); err != nil {
+		log.Printf("Failed to forward agent event to client: %v", err)
+	}
+}
+
+func (h *agentHandler) GetBinary() []*chan *[]byte { return []*chan *[]byte{&h.binaryChan} }
+func (h *agentHandler) GetOpen() []*chan *agentmsg.OpenResponse {
+	return []*chan *agentmsg.OpenResponse{&h.openChan}
+}
+func (h *agentHandler) GetWelcome() []*chan *agentmsg.WelcomeResponse {
+	return []*chan *agentmsg.WelcomeResponse{&h.welcomeChan}
+}
+func (h *agentHandler) GetConversationText() []*chan *agentmsg.ConversationTextResponse {
+	return []*chan *agentmsg.ConversationTextResponse{&h.conversationChan}
+}
+func (h *agentHandler) GetUserStartedSpeaking() []*chan *agentmsg.UserStartedSpeakingResponse {
+	return []*chan *agentmsg.UserStartedSpeakingResponse{&h.userStartedChan}
+}
+func (h *agentHandler) GetAgentThinking() []*chan *agentmsg.AgentThinkingResponse {
+	return []*chan *agentmsg.AgentThinkingResponse{&h.agentThinkingChan}
+}
+func (h *agentHandler) GetFunctionCallRequest() []*chan *agentmsg.FunctionCallRequestResponse {
+	return []*chan *agentmsg.FunctionCallRequestResponse{&h.functionCallChan}
+}
+func (h *agentHandler) GetAgentStartedSpeaking() []*chan *agentmsg.AgentStartedSpeakingResponse {
+	return []*chan *agentmsg.AgentStartedSpeakingResponse{&h.agentStartedChan}
+}
+func (h *agentHandler) GetAgentAudioDone() []*chan *agentmsg.AgentAudioDoneResponse {
+	return []*chan *agentmsg.AgentAudioDoneResponse{&h.agentAudioDoneChan}
+}
+func (h *agentHandler) GetClose() []*chan *agentmsg.CloseResponse {
+	return []*chan *agentmsg.CloseResponse{&h.closeChan}
+}
+func (h *agentHandler) GetError() []*chan *agentmsg.ErrorResponse {
+	return []*chan *agentmsg.ErrorResponse{&h.errorChan}
+}
+func (h *agentHandler) GetUnhandled() []*chan *[]byte { return []*chan *[]byte{&h.unhandledChan} }
+func (h *agentHandler) GetInjectionRefused() []*chan *agentmsg.InjectionRefusedResponse {
+	return []*chan *agentmsg.InjectionRefusedResponse{&h.injectionRefusedChan}
+}
+func (h *agentHandler) GetKeepAlive() []*chan *agentmsg.KeepAlive {
+	return []*chan *agentmsg.KeepAlive{&h.keepAliveChan}
+}
+func (h *agentHandler) GetSettingsApplied() []*chan *agentmsg.SettingsAppliedResponse {
+	return []*chan *agentmsg.SettingsAppliedResponse{&h.settingsAppliedChan}
+}
+
+// Close signals every relay goroutine to exit. Safe to call multiple times;
+// invoked when the session ends (client disconnect or Deepgram-side teardown).
+//
+// Call this only after the SDK client has been stopped (see handleVoiceAgent's
+// defer order). The SDK sends on unbuffered channels, so if an event lands in
+// the window between done closing and the SDK's read loop exiting, that send
+// has no reader and parks the SDK goroutine. Stopping the client first shuts
+// the read loop down before the readers go away.
+func (h *agentHandler) Close() {
+	h.closeOnce.Do(func() {
+		close(h.done)
+	})
+}
+
+// run relays every Deepgram Agent event to the browser connection. Each loop
+// selects on h.done so it exits when the session ends: the SDK never closes
+// the channels it sends on, so a plain `for range ch` would block forever and
+// leak the goroutine (~16 per connection).
+func (h *agentHandler) run() {
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case br, ok := <-h.binaryChan:
+				if !ok {
+					return
+				}
+				if err := writeToBrowser(h.conn, h.mu, websocket.BinaryMessage, *br); err != nil {
+					log.Printf("Failed to forward agent audio to client: %v", err)
+				}
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case _, ok := <-h.openChan:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.welcomeChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.conversationChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.userStartedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.agentThinkingChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.functionCallChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.agentStartedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.agentAudioDoneChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		// Deepgram closed the session: tear down the browser connection so the
+		// handler's ReadMessage pump returns instead of blocking until the
+		// browser happens to disconnect.
+		for {
+			select {
+			case <-h.done:
+				return
+			case _, ok := <-h.closeChan:
+				if !ok {
+					return
+				}
+				h.teardown(websocket.CloseNormalClosure, "")
+			}
+		}
+	}()
+	go func() {
+		// Forward the error to the browser, then end the session — an agent
+		// error is terminal, and leaving the pump blocked would leak the
+		// connection and hang the UI.
+		//
+		// The relay map is hand-built with lowercase keys: the SDK's
+		// ErrorResponse (an alias for DeepgramError) has no json:"type" tag, so
+		// marshaling it directly emits {"Type":"Error",...} (capital T) and the
+		// frontend's `case 'Error'` never fires. Emit type/description/code the
+		// way the browser expects.
+		//
+		// The code is a fixed PROVIDER_ERROR rather than the SDK's ErrCode.
+		// Deepgram's wire Error event is {type, description, code}, but the SDK
+		// struct maps its code field to `err_code`, so the wire code is dropped
+		// during unmarshal and ErrCode is always empty here; the errors the SDK
+		// synthesizes from a transport failure never set it either. The starter
+		// error contract restricts code to its own enum in any case, and
+		// PROVIDER_ERROR is the value it reserves for an upstream failure —
+		// matching what the other voice-agent starters relay.
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.errorChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(map[string]any{
+					"type":        "Error",
+					"description": v.Description,
+					"code":        "PROVIDER_ERROR",
+				})
+				h.teardown(websocket.CloseInternalServerErr, "Deepgram agent error")
+			}
+		}
+	}()
+	go func() {
+		// Events not explicitly modeled by the SDK (e.g. PromptUpdated, SpeakUpdated,
+		// FunctionCallResponse) arrive here as raw bytes; forward them verbatim.
+		for {
+			select {
+			case <-h.done:
+				return
+			case br, ok := <-h.unhandledChan:
+				if !ok {
+					return
+				}
+				h.sendText(*br)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.injectionRefusedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case _, ok := <-h.keepAliveChan:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case <-h.done:
+				return
+			case v, ok := <-h.settingsAppliedChan:
+				if !ok {
+					return
+				}
+				h.sendJSON(v)
+			}
+		}
+	}()
+}
+
+// sendClientError writes a contract-shaped error frame to the browser.
+func sendClientError(conn *websocket.Conn, mu *sync.Mutex, code, description string) {
+	msg, _ := json.Marshal(map[string]string{
+		"type":        "Error",
+		"description": description,
+		"code":        code,
+	})
+	if err := writeToBrowser(conn, mu, websocket.TextMessage, msg); err != nil {
+		log.Printf("Failed to send error frame to client: %v", err)
+	}
+}
+
+// handleVoiceAgent bridges the browser WebSocket to Deepgram's Voice Agent API
+// using the official Go SDK. The frontend still sends its own Settings message
+// first; it is parsed into the SDK SettingsOptions and sent to Deepgram on connect.
 func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 	// Validate JWT from access_token.<jwt> subprotocol
 	protocols := websocket.Subprotocols(r)
@@ -221,102 +601,123 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Println("Client connected to /api/voice-agent")
-	activeConnections.Store(clientConn, true)
-
-	// Connect to Deepgram Voice Agent API
-	// No query parameters needed -- config is sent via JSON after connection
-	log.Println("Initiating Deepgram connection...")
-	deepgramHeader := http.Header{}
-	deepgramHeader.Set("Authorization", fmt.Sprintf("Token %s", appConfig.deepgramAPIKey))
-
-	deepgramConn, _, err := websocket.DefaultDialer.Dial(appConfig.deepgramAgentURL, deepgramHeader)
-	if err != nil {
-		log.Printf("Failed to connect to Deepgram: %v", err)
-		errMsg, _ := json.Marshal(map[string]string{
-			"type":        "Error",
-			"description": "Failed to establish proxy connection",
-			"code":        "CONNECTION_FAILED",
-		})
-		clientConn.WriteMessage(websocket.TextMessage, errMsg)
-		clientConn.Close()
+	defer func() {
 		activeConnections.Delete(clientConn)
+		clientConn.Close()
+	}()
+
+	// Serialize all writes to the browser connection (handler goroutines + close frames).
+	writeMu := &sync.Mutex{}
+
+	log.Println("Initiating Deepgram Agent connection...")
+	cOptions := &dginterfaces.ClientOptions{EnableKeepAlive: true}
+
+	// teardown tears down the browser session exactly once: send a close frame
+	// and close the connection (which unblocks the ReadMessage pump below). It
+	// is invoked by the SDK handler goroutines on a Deepgram-side close/error.
+	var closeOnce sync.Once
+	teardown := func(code int, reason string) {
+		closeOnce.Do(func() {
+			if err := writeToBrowser(clientConn, writeMu, websocket.CloseMessage, websocket.FormatCloseMessage(code, reason)); err != nil {
+				log.Printf("Failed to send close frame to client: %v", err)
+			}
+			clientConn.Close()
+		})
+	}
+	// Register the teardown, not the raw connection: graceful shutdown must not
+	// write to this socket without holding writeMu.
+	activeConnections.Store(clientConn, teardown)
+	handler := newAgentHandler(clientConn, writeMu, teardown)
+	// Signal the relay goroutines to exit when this handler returns (client
+	// disconnect or any error path), so they don't leak.
+	//
+	// Registered BEFORE the dgClient.Stop() defer below, so it runs AFTER it —
+	// the ordering is load-bearing. Stop() pushes a CloseResponse onto the
+	// handler's channel synchronously while holding the SDK's connection mutex,
+	// so if the relay goroutines were already gone that send would block
+	// forever and hang this request goroutine, not merely leak one.
+	defer handler.Close()
+
+	// Settings are deliberately NOT supplied here. The Agent API greets a new
+	// socket with Welcome, and the reference frontend sends its Settings only in
+	// response to that Welcome (frontend/main.js, the 'Welcome' case). Parsing a
+	// Settings message off the browser BEFORE connecting therefore deadlocks:
+	// the browser waits for a Welcome that cannot arrive until Deepgram is
+	// connected, and Deepgram is not connected until the Settings arrive.
+	//
+	// Passing nil keeps the SDK from sending its own Settings on open (see
+	// WSChannel.Start, which skips the auto-send when tOptions is nil), so the
+	// browser's own Settings message is relayed verbatim by the pump below,
+	// exactly as the pre-SDK proxy did. That also keeps the Settings payload
+	// transparent: nothing is narrowed to the SDK's typed SettingsOptions, so a
+	// field newer than the pinned SDK still reaches Deepgram.
+	dgClient, err := agent.NewWSUsingChan(context.Background(), appConfig.deepgramAPIKey, cOptions, nil, agentmsg.AgentMessageChan(handler))
+	if err != nil {
+		log.Printf("Failed to create Deepgram Agent client: %v", err)
+		sendClientError(clientConn, writeMu, "CONNECTION_FAILED", "Failed to establish proxy connection")
 		return
 	}
 
+	if !dgClient.Connect() {
+		log.Printf("Deepgram Agent connection failed")
+		sendClientError(clientConn, writeMu, "CONNECTION_FAILED", "Failed to establish proxy connection")
+		return
+	}
+	// Must run before handler.Close() — see the note on that defer above.
+	defer dgClient.Stop()
+
 	log.Println("Connected to Deepgram Agent API")
 
-	// done channels signal when each forwarding goroutine finishes
-	clientDone := make(chan struct{})
-	deepgramDone := make(chan struct{})
+	// Pump Settings, control messages (text) and audio (binary) from the browser
+	// to Deepgram.
+	firstClientMessage := true
+	for {
+		msgType, data, err := clientConn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("Client read error: %v", err)
+			} else {
+				log.Println("Client disconnected")
+			}
+			break
+		}
 
-	// Forward messages: Deepgram -> Client
-	go func() {
-		defer close(deepgramDone)
-		for {
-			messageType, data, err := deepgramConn.ReadMessage()
-			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Println("Deepgram connection closed normally")
-				} else {
-					log.Printf("Deepgram read error: %v", err)
-				}
-				// Translate reserved close codes to 1000 before forwarding to client
-				closeCode := websocket.CloseNormalClosure
-				if ce, ok := err.(*websocket.CloseError); ok {
-					closeCode = getSafeCloseCode(ce.Code)
-				}
-				clientConn.WriteMessage(websocket.CloseMessage,
-					websocket.FormatCloseMessage(closeCode, ""))
+		switch msgType {
+		case websocket.BinaryMessage:
+			if err := dgClient.WriteBinary(data); err != nil {
+				log.Printf("Error writing audio to Deepgram: %v", err)
 				return
 			}
-			if err := clientConn.WriteMessage(messageType, data); err != nil {
-				log.Printf("Error forwarding to client: %v", err)
-				return
+		case websocket.TextMessage:
+			// Settings and control messages (UpdateSpeak, UpdatePrompt,
+			// InjectAgentMessage, ...) are forwarded as the raw bytes the browser
+			// sent. Decoding into map[string]interface{} and re-marshaling would
+			// route every JSON number through float64, silently losing integer
+			// precision above 2^53 and reformatting anything from 1e21 upwards
+			// into exponent notation, so a numeric field could reach Deepgram
+			// altered. Validate that it is JSON, then relay verbatim.
+			if !json.Valid(data) {
+				if firstClientMessage {
+					// The first frame is the browser's Settings; a malformed one
+					// is worth naming rather than ignoring.
+					log.Printf("Ignoring malformed Settings message from client")
+					sendClientError(clientConn, writeMu, "INVALID_SETTINGS", "Invalid Settings message")
+					return
+				}
+				log.Printf("Ignoring non-JSON control message from client")
+				continue
+			}
+			firstClientMessage = false
+			if err := dgClient.WriteJSON(json.RawMessage(data)); err != nil {
+				log.Printf("Error forwarding control message to Deepgram: %v", err)
 			}
 		}
-	}()
-
-	// Forward messages: Client -> Deepgram
-	go func() {
-		defer close(clientDone)
-		for {
-			messageType, data, err := clientConn.ReadMessage()
-			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Println("Client disconnected normally")
-				} else {
-					log.Printf("Client read error: %v", err)
-				}
-				// Complete the close handshake by replying with a close frame
-				closeCode := websocket.CloseNormalClosure
-				if ce, ok := err.(*websocket.CloseError); ok {
-					closeCode = getSafeCloseCode(ce.Code)
-				}
-				clientConn.WriteMessage(websocket.CloseMessage,
-					websocket.FormatCloseMessage(closeCode, ""))
-				return
-			}
-			if err := deepgramConn.WriteMessage(messageType, data); err != nil {
-				log.Printf("Error forwarding to Deepgram: %v", err)
-				return
-			}
-		}
-	}()
-
-	// Wait for either side to close, then clean up both
-	select {
-	case <-clientDone:
-		log.Println("Client disconnected, closing Deepgram connection")
-		deepgramConn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Client disconnected"))
-		deepgramConn.Close()
-		clientConn.Close()
-	case <-deepgramDone:
-		log.Println("Deepgram disconnected, closing client connection")
-		clientConn.Close()
 	}
 
-	activeConnections.Delete(clientConn)
+	log.Println("Voice agent session ending")
+	writeMu.Lock()
+	clientConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+	writeMu.Unlock()
 }
 
 // ============================================================================
@@ -327,13 +728,17 @@ func handleVoiceAgent(w http.ResponseWriter, r *http.Request) {
 func gracefulShutdown(server *http.Server, sig string) {
 	log.Printf("\n%s signal received: starting graceful shutdown...", sig)
 
-	// Close all active WebSocket connections
+	// Close all active WebSocket connections through each connection's teardown.
+	// Writing here directly would race the relay goroutines still forwarding
+	// agent audio, and gorilla's concurrent-write detection would panic this
+	// goroutine, crashing the process instead of shutting down cleanly.
 	count := 0
 	activeConnections.Range(func(key, value interface{}) bool {
-		conn := key.(*websocket.Conn)
-		conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutting down"))
-		conn.Close()
+		teardown, ok := value.(func(code int, reason string))
+		if !ok {
+			return true
+		}
+		teardown(websocket.CloseGoingAway, "Server shutting down")
 		count++
 		return true
 	})
@@ -384,6 +789,9 @@ func main() {
 			log.Fatal("Failed to generate session secret:", err)
 		}
 	}
+
+	// Initialize the Deepgram Go SDK.
+	agent.InitWithDefault()
 
 	// Register HTTP and WebSocket routes
 	mux := http.NewServeMux()
