@@ -1,6 +1,6 @@
 module go-voice-agent
 
-go 1.23
+go 1.23.0
 
 require (
 	github.com/BurntSushi/toml v1.4.0
@@ -17,6 +17,6 @@ require (
 	github.com/hokaccha/go-prettyjson v0.0.0-20211117102719-0474bc63780f // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect
-	golang.org/x/sys v0.6.0 // indirect
+	golang.org/x/sys v0.31.0 // indirect
 	k8s.io/klog/v2 v2.110.1 // indirect
 )
